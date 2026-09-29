@@ -37,12 +37,16 @@ import argparse
 import datetime
 import json
 import os
+import ssl
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Create unverified SSL context for self-signed SSL cert support
+SSL_CONTEXT = ssl._create_unverified_context()
 
 # Terminal Color Formatting
 class Colors:
@@ -132,7 +136,7 @@ class SeerrClient:
             req = urllib.request.Request(current_url, data=data, headers=headers, method=method)
 
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout, context=SSL_CONTEXT) as resp:
                     final_url = resp.geturl()
                     if "/api/v1" in final_url:
                         self.base_url = final_url.split("/api/v1")[0]
@@ -229,7 +233,7 @@ class RadarrClient:
             req = urllib.request.Request(current_url, data=data, headers=headers, method=method)
 
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout, context=SSL_CONTEXT) as resp:
                     final_url = resp.geturl()
                     if "/api/v3" in final_url:
                         self.base_url = final_url.split("/api/v3")[0]
@@ -364,7 +368,7 @@ class SonarrClient:
             req = urllib.request.Request(current_url, data=data, headers=headers, method=method)
 
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout, context=SSL_CONTEXT) as resp:
                     final_url = resp.geturl()
                     if "/api/v3" in final_url:
                         self.base_url = final_url.split("/api/v3")[0]
@@ -693,31 +697,33 @@ def main():
         sys.exit(1)
     print(f"{Colors.OKGREEN}✓ {msg}{Colors.ENDC}")
 
-    # Initialize Radarr Client
+    # Initialize Radarr Client (only if target media includes movies)
     radarr: Optional[RadarrClient] = None
     existing_radarr_tmdb_map: Dict[int, int] = {}
-    if args.radarr_url and args.radarr_api_key:
+    if args.media_type in ("movie", "all") and args.radarr_url and args.radarr_api_key:
         radarr = RadarrClient(args.radarr_url, args.radarr_api_key)
         r_ok, r_msg = radarr.test_connection()
-        if not r_ok:
-            print(f"{Colors.FAIL}Radarr Connection Error: {r_msg}{Colors.ENDC}")
-            sys.exit(1)
-        print(f"{Colors.OKGREEN}✓ Direct Radarr Mode Active: {r_msg}{Colors.ENDC}")
-        existing_radarr_tmdb_map = radarr.get_existing_tmdb_ids()
-        print(f"  Found {len(existing_radarr_tmdb_map)} existing movies in Radarr library.")
+        if r_ok:
+            print(f"{Colors.OKGREEN}✓ Direct Radarr Mode Active: {r_msg}{Colors.ENDC}")
+            existing_radarr_tmdb_map = radarr.get_existing_tmdb_ids()
+            print(f"  Found {len(existing_radarr_tmdb_map)} existing movies in Radarr library.")
+        else:
+            print(f"{Colors.WARNING}* Radarr Connection Warning ({r_msg}). Falling back to Overseerr Retry Mode for Movies.{Colors.ENDC}")
+            radarr = None
 
-    # Initialize Sonarr Client
+    # Initialize Sonarr Client (only if target media includes TV shows)
     sonarr: Optional[SonarrClient] = None
     existing_sonarr_tvdb_map: Dict[int, int] = {}
-    if args.sonarr_url and args.sonarr_api_key:
+    if args.media_type in ("tv", "all") and args.sonarr_url and args.sonarr_api_key:
         sonarr = SonarrClient(args.sonarr_url, args.sonarr_api_key)
         s_ok, s_msg = sonarr.test_connection()
-        if not s_ok:
-            print(f"{Colors.FAIL}Sonarr Connection Error: {s_msg}{Colors.ENDC}")
-            sys.exit(1)
-        print(f"{Colors.OKGREEN}✓ Direct Sonarr Mode Active: {s_msg}{Colors.ENDC}")
-        existing_sonarr_tvdb_map = sonarr.get_existing_tvdb_ids()
-        print(f"  Found {len(existing_sonarr_tvdb_map)} existing series in Sonarr library.")
+        if s_ok:
+            print(f"{Colors.OKGREEN}✓ Direct Sonarr Mode Active: {s_msg}{Colors.ENDC}")
+            existing_sonarr_tvdb_map = sonarr.get_existing_tvdb_ids()
+            print(f"  Found {len(existing_sonarr_tvdb_map)} existing series in Sonarr library.")
+        else:
+            print(f"{Colors.WARNING}* Sonarr Connection Warning ({s_msg}). Falling back to Overseerr Retry Mode for TV Shows.{Colors.ENDC}")
+            sonarr = None
 
     if not radarr and not sonarr:
         print(f"{Colors.WARNING}* Running in Overseerr Retry Mode. (Tip: Pass --radarr-url / --sonarr-url to enable Direct Servarr Injection!){Colors.ENDC}")
