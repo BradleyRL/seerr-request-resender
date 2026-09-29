@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Seerr (Overseerr / Jellyseerr) & Radarr Request Resender
-=========================================================
+Seerr (Overseerr / Jellyseerr), Radarr & Sonarr Request Resender
+=================================================================
 A CLI utility to find approved, processing requests in Overseerr or Jellyseerr
-and resend/retry them to Radarr.
+and resend/retry them to Radarr (for movies) and Sonarr (for TV shows).
 
 Supports two modes:
   1. Overseerr Retry Mode (Default): Calls POST /api/v1/request/{id}/retry in Overseerr.
-  2. Direct Radarr Sync Mode: Directly queries Radarr via API, adds missing movies, 
-     and triggers search commands directly in Radarr (bypasses Overseerr queue issues!).
+  2. Direct Servarr Sync Mode: Directly queries Radarr or Sonarr via API, adds missing 
+     movies or TV series, and triggers search commands directly in Radarr/Sonarr 
+     (bypasses Overseerr queue issues entirely!).
 
 Requirements:
     Python 3.7+ (No external pip packages required!)
@@ -17,16 +18,19 @@ Usage:
     # Mode 1: Retry approved processing requests via Overseerr API
     python3 resend_seerr_requests.py --url http://localhost:5055 --api-key OVERSEERR_KEY
 
-    # Mode 2: Direct Radarr Sync (Injects missing approved requests directly into Radarr & triggers search)
+    # Mode 2: Direct Radarr & Sonarr Sync
     python3 resend_seerr_requests.py \
       --url http://localhost:5055 --api-key OVERSEERR_KEY \
-      --radarr-url http://localhost:7878 --radarr-api-key RADARR_KEY
+      --radarr-url http://localhost:7878 --radarr-api-key RADARR_KEY \
+      --sonarr-url http://localhost:8989 --sonarr-api-key SONARR_KEY
 
 Environment Variables (Optional):
     SEERR_URL       - Overseerr / Jellyseerr base URL
     SEERR_API_KEY   - Overseerr / Jellyseerr API key
     RADARR_URL      - Radarr base URL (e.g., http://localhost:7878)
     RADARR_API_KEY  - Radarr API key
+    SONARR_URL      - Sonarr base URL (e.g., http://localhost:8989)
+    SONARR_API_KEY  - Sonarr API key
 """
 
 import argparse
@@ -336,11 +340,165 @@ class RadarrClient:
         return False, data.get("message", f"HTTP {status}")
 
 
+class SonarrClient:
+    """HTTP Client for Sonarr API v3."""
+
+    def __init__(self, base_url: str, api_key: str, timeout: int = 15):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def _request(
+        self, endpoint: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None, max_redirects: int = 5
+    ) -> Tuple[int, Any]:
+        headers = {
+            "X-Api-Key": self.api_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Seerr-Sonarr-Sync/2.0",
+        }
+
+        current_url = f"{self.base_url}/api/v3{endpoint}"
+        for _ in range(max_redirects):
+            data = json.dumps(payload).encode("utf-8") if payload is not None else None
+            req = urllib.request.Request(current_url, data=data, headers=headers, method=method)
+
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    final_url = resp.geturl()
+                    if "/api/v3" in final_url:
+                        self.base_url = final_url.split("/api/v3")[0]
+                    resp_data = resp.read().decode("utf-8")
+                    json_resp = json.loads(resp_data) if resp_data else {}
+                    return resp.status, json_resp
+            except urllib.error.HTTPError as e:
+                if e.code in (301, 302, 303, 307, 308):
+                    location = e.headers.get("Location")
+                    if location:
+                        current_url = urllib.parse.urljoin(current_url, location)
+                        if "/api/v3" in current_url:
+                            self.base_url = current_url.split("/api/v3")[0]
+                        continue
+                try:
+                    err_body = e.read().decode("utf-8")
+                    err_json = json.loads(err_body)
+                except Exception:
+                    err_json = {"message": str(e)}
+                return e.code, err_json
+            except urllib.error.URLError as e:
+                return 0, {"message": f"URL / Network Error: {e.reason}"}
+            except Exception as e:
+                return 0, {"message": f"Unexpected Error: {str(e)}"}
+
+        return 307, {"message": f"Too many redirects ({current_url})"}
+
+    def test_connection(self) -> Tuple[bool, str]:
+        status, data = self._request("/system/status")
+        if status == 200:
+            version = data.get("version", "Unknown")
+            return True, f"Successfully connected to Sonarr (v{version})"
+        return False, data.get("message", f"HTTP Error {status}")
+
+    def get_existing_tvdb_ids(self) -> Dict[int, int]:
+        """Returns dict mapping tvdbId -> sonarr_series_id for all series in Sonarr."""
+        status, data = self._request("/series")
+        series_map = {}
+        if status == 200 and isinstance(data, list):
+            for s in data:
+                tvdb_id = s.get("tvdbId")
+                sonarr_id = s.get("id")
+                if tvdb_id and sonarr_id:
+                    series_map[tvdb_id] = sonarr_id
+        return series_map
+
+    def get_default_quality_profile_id(self) -> int:
+        status, data = self._request("/qualityprofile")
+        if status == 200 and isinstance(data, list) and len(data) > 0:
+            return data[0].get("id", 1)
+        return 1
+
+    def get_default_language_profile_id(self) -> int:
+        status, data = self._request("/languageprofile")
+        if status == 200 and isinstance(data, list) and len(data) > 0:
+            return data[0].get("id", 1)
+        return 1
+
+    def get_default_root_folder(self) -> str:
+        status, data = self._request("/rootfolder")
+        if status == 200 and isinstance(data, list) and len(data) > 0:
+            return data[0].get("path", "")
+        return ""
+
+    def add_series_by_tvdb(
+        self,
+        tvdb_id: Optional[int],
+        tmdb_id: Optional[int] = None,
+        quality_profile_id: Optional[int] = None,
+        language_profile_id: Optional[int] = None,
+        root_folder_path: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Directly adds a series to Sonarr via TVDB/TMDB lookup."""
+        term = f"tvdb:{tvdb_id}" if tvdb_id else f"tmdb:{tmdb_id}" if tmdb_id else None
+        if not term:
+            return False, "Neither TVDB ID nor TMDB ID provided for Sonarr lookup"
+
+        status, lookup_resp = self._request(f"/series/lookup?term={urllib.parse.quote(term)}")
+        if status != 200:
+            return False, f"Sonarr lookup failed (HTTP {status})"
+
+        series_data = None
+        if isinstance(lookup_resp, dict) and (lookup_resp.get("tvdbId") or lookup_resp.get("title")):
+            series_data = lookup_resp
+        elif isinstance(lookup_resp, list) and len(lookup_resp) > 0:
+            series_data = lookup_resp[0]
+
+        if not series_data:
+            return False, f"Series lookup '{term}' not found in Sonarr"
+
+        q_id = quality_profile_id or self.get_default_quality_profile_id()
+        l_id = language_profile_id or self.get_default_language_profile_id()
+        r_path = root_folder_path or self.get_default_root_folder()
+
+        if not r_path:
+            return False, "No valid root folder path configured in Sonarr"
+
+        series_data["qualityProfileId"] = q_id
+        if l_id and ("languageProfileId" in series_data or not series_data.get("languageProfileId")):
+            series_data["languageProfileId"] = l_id
+        series_data["rootFolderPath"] = r_path
+        series_data["monitored"] = True
+        series_data["seasonFolder"] = True
+        series_data["addOptions"] = {
+            "searchForMissingEpisodes": True,
+            "ignoreEpisodesWithFiles": False,
+            "ignoreEpisodesWithoutFiles": False,
+        }
+
+        post_status, post_resp = self._request("/series", method="POST", payload=series_data)
+        if post_status in (200, 201):
+            return True, "Added to Sonarr & search triggered"
+
+        if isinstance(post_resp, list) and len(post_resp) > 0:
+            err_msg = post_resp[0].get("errorMessage") or str(post_resp)
+        else:
+            err_msg = post_resp.get("message") or post_resp.get("error") or f"HTTP {post_status}"
+        return False, err_msg
+
+    def trigger_series_search(self, series_id: int) -> Tuple[bool, str]:
+        """Triggers a SeriesSearch command in Sonarr."""
+        payload = {"name": "SeriesSearch", "seriesId": series_id}
+        status, data = self._request("/command", method="POST", payload=payload)
+        if status in (200, 201):
+            return True, "Sonarr search command issued successfully"
+        return False, data.get("message", f"HTTP {status}")
+
+
 def extract_media_title(req: Dict[str, Any], client: SeerrClient) -> str:
-    """Attempts to resolve movie title."""
+    """Attempts to resolve media (movie or show) title."""
     media = req.get("media") or {}
-    media_type = media.get("mediaType") or req.get("type") or "movie"
+    media_type = (media.get("mediaType") or req.get("type") or "movie").lower()
     tmdb_id = media.get("tmdbId") or req.get("tmdbId")
+    tvdb_id = media.get("tvdbId") or req.get("tvdbId")
 
     if media.get("title"):
         return media.get("title")
@@ -356,6 +514,8 @@ def extract_media_title(req: Dict[str, Any], client: SeerrClient) -> str:
                 release_year = (data.get("releaseDate") or data.get("firstAirDate") or "")[:4]
                 return f"{title} ({release_year})" if release_year else title
 
+    if tvdb_id:
+        return f"TVDB #{tvdb_id}"
     return f"TMDB #{tmdb_id}" if tmdb_id else f"Request #{req.get('id')}"
 
 
@@ -369,7 +529,7 @@ def parse_date(date_str: Optional[str]) -> Optional[datetime.datetime]:
         return None
 
 
-def format_request_summary(req: Dict[str, Any], title: str, radarr_id: Optional[int] = None) -> str:
+def format_request_summary(req: Dict[str, Any], title: str, servarr_id: Optional[int] = None) -> str:
     req_id = req.get("id")
     media = req.get("media") or {}
     media_type = (media.get("mediaType") or req.get("type") or "movie").upper()
@@ -379,15 +539,16 @@ def format_request_summary(req: Dict[str, Any], title: str, radarr_id: Optional[
     req_status_str = REQUEST_STATUS_MAP.get(req_status_id, f"STATUS_{req_status_id}")
     media_status_str = MEDIA_STATUS_MAP.get(media_status_id, f"MEDIA_{media_status_id}")
 
-    ext_id = radarr_id if radarr_id is not None else media.get("externalServiceId")
-    ext_str = f"Radarr ID: {ext_id}" if ext_id is not None else f"{Colors.FAIL}Radarr ID: MISSING{Colors.ENDC}"
+    ext_id = servarr_id if servarr_id is not None else media.get("externalServiceId")
+    servarr_name = "Radarr/Sonarr" if media_type == "ALL" else ("Sonarr" if media_type == "TV" else "Radarr")
+    ext_str = f"{servarr_name} ID: {ext_id}" if ext_id is not None else f"{Colors.FAIL}{servarr_name} ID: MISSING{Colors.ENDC}"
 
     created_at = req.get("createdAt", "")[:10]
 
     return (
         f"[{Colors.BOLD}#{req_id: <4}{Colors.ENDC}] "
         f"{Colors.OKCYAN}{media_type: <5}{Colors.ENDC} | "
-        f"{Colors.BOLD}{title[:32]: <32}{Colors.ENDC} | "
+        f"{Colors.BOLD}{title[:30]: <30}{Colors.ENDC} | "
         f"Req: {Colors.OKBLUE}{req_status_str}{Colors.ENDC} | "
         f"Media: {Colors.WARNING if media_status_str in ('PENDING', 'PROCESSING') else Colors.OKGREEN}{media_status_str}{Colors.ENDC} | "
         f"{ext_str} | Date: {created_at}"
@@ -398,7 +559,7 @@ def main():
     load_env_file()
 
     parser = argparse.ArgumentParser(
-        description="Resend / sync approved Overseerr requests to Radarr.",
+        description="Resend / sync approved Overseerr requests to Radarr & Sonarr.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
@@ -414,11 +575,11 @@ def main():
         help="Overseerr API Key. Default: $SEERR_API_KEY",
     )
 
-    group_radarr = parser.add_argument_group("Radarr Direct Connection (Optional - For Direct Injection)")
+    group_radarr = parser.add_argument_group("Radarr Connection (Direct Injection for Movies)")
     group_radarr.add_argument(
         "--radarr-url",
         default=os.getenv("RADARR_URL"),
-        help="Radarr Base URL (e.g. http://localhost:7878). If provided, enables Direct Radarr Injection mode.",
+        help="Radarr Base URL (e.g. http://localhost:7878). Enables Direct Radarr Injection mode.",
     )
     group_radarr.add_argument(
         "--radarr-api-key",
@@ -435,12 +596,38 @@ def main():
         help="Radarr Root Folder Path for direct injection (e.g. /movies).",
     )
 
+    group_sonarr = parser.add_argument_group("Sonarr Connection (Direct Injection for TV Shows)")
+    group_sonarr.add_argument(
+        "--sonarr-url",
+        default=os.getenv("SONARR_URL"),
+        help="Sonarr Base URL (e.g. http://localhost:8989). Enables Direct Sonarr Injection mode.",
+    )
+    group_sonarr.add_argument(
+        "--sonarr-api-key",
+        default=os.getenv("SONARR_API_KEY"),
+        help="Sonarr API Key.",
+    )
+    group_sonarr.add_argument(
+        "--sonarr-quality-profile-id",
+        type=int,
+        help="Sonarr Quality Profile ID for direct injection (optional).",
+    )
+    group_sonarr.add_argument(
+        "--sonarr-language-profile-id",
+        type=int,
+        help="Sonarr Language Profile ID for direct injection (optional).",
+    )
+    group_sonarr.add_argument(
+        "--sonarr-root-folder",
+        help="Sonarr Root Folder Path for direct injection (e.g. /tv).",
+    )
+
     group_filter = parser.add_argument_group("Filter Options")
     group_filter.add_argument(
         "--media-type",
         choices=["movie", "tv", "all"],
-        default="movie",
-        help="Filter by media type: 'movie' (Radarr), 'tv' (Sonarr), or 'all'. Default: movie",
+        default="all",
+        help="Filter by media type: 'movie' (Radarr), 'tv' (Sonarr), or 'all' (Default: all)",
     )
     group_filter.add_argument(
         "--status",
@@ -450,7 +637,7 @@ def main():
         "  approved_processing : Only APPROVED requests currently in PROCESSING or PENDING state (Default)\n"
         "  processing          : Only media in PROCESSING state (status 3)\n"
         "  pending             : Only media in PENDING state (status 2)\n"
-        "  failed              : Only requests missing Radarr external service ID\n"
+        "  failed              : Only requests missing Radarr/Sonarr external service ID\n"
         "  all                 : All approved non-available requests",
     )
     group_filter.add_argument(
@@ -495,9 +682,9 @@ def main():
         print(f"{Colors.FAIL}Error: Overseerr --url and --api-key (or $SEERR_URL and $SEERR_API_KEY) are required.{Colors.ENDC}")
         sys.exit(1)
 
-    print(f"\n{Colors.BOLD}{Colors.HEADER}===================================================={Colors.ENDC}")
-    print(f"{Colors.BOLD}{Colors.HEADER}  Seerr & Radarr Request Resender & Direct Sync CLI  {Colors.ENDC}")
-    print(f"{Colors.BOLD}{Colors.HEADER}===================================================={Colors.ENDC}\n")
+    print(f"\n{Colors.BOLD}{Colors.HEADER}=================================================================={Colors.ENDC}")
+    print(f"{Colors.BOLD}{Colors.HEADER}  Seerr, Radarr & Sonarr Request Resender & Direct Sync CLI  {Colors.ENDC}")
+    print(f"{Colors.BOLD}{Colors.HEADER}=================================================================={Colors.ENDC}\n")
 
     seerr = SeerrClient(args.url, args.api_key)
     ok, msg = seerr.test_connection()
@@ -506,9 +693,9 @@ def main():
         sys.exit(1)
     print(f"{Colors.OKGREEN}✓ {msg}{Colors.ENDC}")
 
+    # Initialize Radarr Client
     radarr: Optional[RadarrClient] = None
     existing_radarr_tmdb_map: Dict[int, int] = {}
-
     if args.radarr_url and args.radarr_api_key:
         radarr = RadarrClient(args.radarr_url, args.radarr_api_key)
         r_ok, r_msg = radarr.test_connection()
@@ -517,9 +704,25 @@ def main():
             sys.exit(1)
         print(f"{Colors.OKGREEN}✓ Direct Radarr Mode Active: {r_msg}{Colors.ENDC}")
         existing_radarr_tmdb_map = radarr.get_existing_tmdb_ids()
-        print(f"  Found {len(existing_radarr_tmdb_map)} existing movies in Radarr library.\n")
-    else:
-        print(f"{Colors.WARNING}* Running in Overseerr Retry Mode. (Tip: Pass --radarr-url and --radarr-api-key to inject directly into Radarr if Overseerr retry is failing!){Colors.ENDC}\n")
+        print(f"  Found {len(existing_radarr_tmdb_map)} existing movies in Radarr library.")
+
+    # Initialize Sonarr Client
+    sonarr: Optional[SonarrClient] = None
+    existing_sonarr_tvdb_map: Dict[int, int] = {}
+    if args.sonarr_url and args.sonarr_api_key:
+        sonarr = SonarrClient(args.sonarr_url, args.sonarr_api_key)
+        s_ok, s_msg = sonarr.test_connection()
+        if not s_ok:
+            print(f"{Colors.FAIL}Sonarr Connection Error: {s_msg}{Colors.ENDC}")
+            sys.exit(1)
+        print(f"{Colors.OKGREEN}✓ Direct Sonarr Mode Active: {s_msg}{Colors.ENDC}")
+        existing_sonarr_tvdb_map = sonarr.get_existing_tvdb_ids()
+        print(f"  Found {len(existing_sonarr_tvdb_map)} existing series in Sonarr library.")
+
+    if not radarr and not sonarr:
+        print(f"{Colors.WARNING}* Running in Overseerr Retry Mode. (Tip: Pass --radarr-url / --sonarr-url to enable Direct Servarr Injection!){Colors.ENDC}")
+
+    print("")
 
     # Fetch Overseerr requests
     requests_list = seerr.get_all_requests()
@@ -590,11 +793,19 @@ def main():
     printable_items: List[Tuple[Dict[str, Any], str, Optional[int]]] = []
     for req in matching_requests:
         media = req.get("media") or {}
+        media_type = (media.get("mediaType") or req.get("type") or "movie").lower()
         tmdb_id = media.get("tmdbId") or req.get("tmdbId")
-        radarr_id = existing_radarr_tmdb_map.get(tmdb_id) if radarr and tmdb_id else None
+        tvdb_id = media.get("tvdbId") or req.get("tvdbId")
+
+        servarr_id = None
+        if media_type == "movie" and radarr and tmdb_id:
+            servarr_id = existing_radarr_tmdb_map.get(tmdb_id)
+        elif media_type == "tv" and sonarr and tvdb_id:
+            servarr_id = existing_sonarr_tvdb_map.get(tvdb_id)
+
         title = extract_media_title(req, seerr)
-        printable_items.append((req, title, radarr_id))
-        print(format_request_summary(req, title, radarr_id))
+        printable_items.append((req, title, servarr_id))
+        print(format_request_summary(req, title, servarr_id))
 
     print("-" * 80)
 
@@ -612,26 +823,26 @@ def main():
     success_count = 0
     fail_count = 0
 
-    for idx, (req, title, radarr_id) in enumerate(printable_items, start=1):
+    for idx, (req, title, servarr_id) in enumerate(printable_items, start=1):
         req_id = req.get("id")
         media = req.get("media") or {}
+        media_type = (media.get("mediaType") or req.get("type") or "movie").lower()
         tmdb_id = media.get("tmdbId") or req.get("tmdbId")
+        tvdb_id = media.get("tvdbId") or req.get("tvdbId")
 
         print(f"[{idx}/{len(printable_items)}] Request #{req_id} ({title})... ", end="", flush=True)
 
-        if radarr and tmdb_id:
+        if media_type == "movie" and radarr:
             # DIRECT RADARR MODE
-            if radarr_id:
-                # Already in Radarr! Trigger search
-                s_ok, s_msg = radarr.trigger_movie_search([radarr_id])
+            if servarr_id:
+                s_ok, s_msg = radarr.trigger_movie_search([servarr_id])
                 if s_ok:
-                    print(f"{Colors.OKGREEN}✓ Movie already in Radarr -> Triggered Radarr Search{Colors.ENDC}")
+                    print(f"{Colors.OKGREEN}✓ Movie in Radarr -> Triggered Search{Colors.ENDC}")
                     success_count += 1
                 else:
-                    print(f"{Colors.WARNING}In Radarr, but search failed: {s_msg}{Colors.ENDC}")
+                    print(f"{Colors.WARNING}In Radarr, search failed: {s_msg}{Colors.ENDC}")
                     fail_count += 1
             else:
-                # Missing from Radarr -> Inject directly
                 a_ok, a_msg = radarr.add_movie_by_tmdb(
                     tmdb_id=tmdb_id,
                     quality_profile_id=args.radarr_quality_profile_id,
@@ -643,6 +854,32 @@ def main():
                 else:
                     print(f"{Colors.FAIL}✗ Direct Radarr Injection Failed ({a_msg}){Colors.ENDC}")
                     fail_count += 1
+
+        elif media_type == "tv" and sonarr:
+            # DIRECT SONARR MODE
+            if servarr_id:
+                s_ok, s_msg = sonarr.trigger_series_search(servarr_id)
+                if s_ok:
+                    print(f"{Colors.OKGREEN}✓ Series in Sonarr -> Triggered Search{Colors.ENDC}")
+                    success_count += 1
+                else:
+                    print(f"{Colors.WARNING}In Sonarr, search failed: {s_msg}{Colors.ENDC}")
+                    fail_count += 1
+            else:
+                a_ok, a_msg = sonarr.add_series_by_tvdb(
+                    tvdb_id=tvdb_id,
+                    tmdb_id=tmdb_id,
+                    quality_profile_id=args.sonarr_quality_profile_id,
+                    language_profile_id=args.sonarr_language_profile_id,
+                    root_folder_path=args.sonarr_root_folder,
+                )
+                if a_ok:
+                    print(f"{Colors.OKGREEN}✓ INJECTED DIRECTLY INTO SONARR & SEARCH STARTED!{Colors.ENDC}")
+                    success_count += 1
+                else:
+                    print(f"{Colors.FAIL}✗ Direct Sonarr Injection Failed ({a_msg}){Colors.ENDC}")
+                    fail_count += 1
+
         else:
             # OVERSEERR RETRY MODE
             ok, msg = seerr.retry_request(req_id)
